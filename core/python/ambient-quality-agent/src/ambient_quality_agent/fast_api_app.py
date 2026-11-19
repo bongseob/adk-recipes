@@ -1,0 +1,337 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""ASGI entrypoint for the AQA container image (see the repository Dockerfile).
+
+Wiring::
+
+    ADK app builder ──► app ◄── routers from core.ambient.routes, core.command_routes
+        │ registers the unary and streaming Agent Runtime query routes
+        │ lifespan
+        ▼
+    _lifespan()
+        ├──► backends.configure_providers()
+        ├──► check_investigations_schema(), check_insights_schema() ──► BigQuery
+        ├──► attach_a2a_routes() onto app, at the chat agent's A2A path
+        │      ├ agent: chat_agent.build_chat_agent()
+        │      ├ runner: Runner ◄── services.get_session_service(),
+        │      │                    services.get_artifact_service()
+        │      └ task store: _build_task_store() ──► GcsTaskStore ──► GCS
+        │                                            or LocalTaskStore
+        └──► telemetry.setup.shutdown_spans() on exit
+
+    /lha/contexts* ──► LocalTaskStore (when running without a jobs bucket)
+
+    global tracer provider ──► telemetry.setup.attach_gcs_exporter()
+
+Agent Runtime builds the Dockerfile and runs its CMD; it injects no serving
+code, so the container must implement the runtime contract itself:
+
+    "If you choose to deploy your agent using a custom container or a
+    Dockerfile, your container must adhere to the runtime contract to
+    successfully serve queries. [...] the container must listen for HTTP
+    requests on 0.0.0.0 on port 8080."
+
+    https://docs.cloud.google.com/gemini-enterprise-agent-platform/scale/runtime/runtime-contract
+
+That contract is two routes -- `/api/reasoning_engine` (unary) and
+`/api/stream_reasoning_engine` (streaming) -- each receiving a JSON body of
+`{class_method, input}`. They back `:query`, `:streamQuery` and, critically for
+AQA, `:asyncQuery`: durable investigations execute as async query jobs, so a
+container without these routes deploys and chats but can never finish an
+investigation.
+
+ADK already implements both. `get_fast_api_app` registers them, but only when
+`gemini_enterprise_app_name` is passed. Opting in that way is why this file is
+small -- everything below is configuration, not a reimplementation.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from a2a.server.tasks import TaskStore
+from ambient_quality_agent import backends
+from ambient_quality_agent import config as config_module
+from ambient_quality_agent.app_utils import services
+from ambient_quality_agent.app_utils.a2a import attach_a2a_routes
+from ambient_quality_agent.app_utils.task_store import (
+    GcsTaskStore,
+    LocalTaskStore,
+)
+from ambient_quality_agent.core import chat_agent
+from ambient_quality_agent.core.ambient.routes import router as ambient_router
+from ambient_quality_agent.core.command_routes import router as commands_router
+from ambient_quality_agent.startup_checks import (
+    check_insights_schema,
+    check_investigations_schema,
+)
+from ambient_quality_agent.telemetry import setup as telemetry_setup
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from google.adk.apps import App
+from google.adk.cli.fast_api import get_fast_api_app
+from google.adk.runners import Runner
+from opentelemetry import trace
+
+_package_logger = logging.getLogger(__package__)
+if not _package_logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    _package_logger.addHandler(_handler)
+    _package_logger.setLevel(logging.INFO)
+
+AGENT_DIR = services.AGENT_DIR
+APP_NAME = "ambient_quality_agent"
+
+# Where the chat agent answers. The UI proxy forwards `/a2a` here, and the card
+# is served at `<this>/.well-known/agent-card.json`.
+A2A_RPC_PATH = f"/a2a/{chat_agent.AGENT_NAME}"
+
+
+def _use_lf_sse_frames() -> None:
+    """Make the A2A SDK end SSE frames with LF rather than CRLF.
+
+    Agent Runtime's SSE relay dispatches a frame only on a blank **LF** line,
+    and `sse_starlette` writes CRLF. Without this the browser receives exactly
+    one frame and the chat hangs -- not an error, just silence. Both classes
+    hold the separator as a class attribute, so one assignment covers every
+    response the SDK builds.
+
+    Remove this once Agent Runtime's relay accepts CRLF. Note there is no local
+    reproduction: curl, uvicorn and the browser all parse CRLF frames happily,
+    so this only ever shows up through a deployed Agent Runtime agent.
+    """
+    from sse_starlette.event import ServerSentEvent
+    from sse_starlette.sse import EventSourceResponse
+
+    ServerSentEvent.DEFAULT_SEPARATOR = "\n"
+    EventSourceResponse.DEFAULT_SEPARATOR = "\n"
+
+
+_use_lf_sse_frames()
+
+
+_local_task_store: LocalTaskStore | None = None
+_CONTEXT_TITLE_MAX_LENGTH = 200
+
+
+def _build_task_store() -> TaskStore:
+    """Builds a task store for conversation persistence.
+
+    Uses GCS when a jobs bucket is configured, otherwise falls back to an
+    in-memory task store.
+
+    Returns:
+        TaskStore instance (GcsTaskStore or LocalTaskStore).
+    """
+    global _local_task_store
+    bucket = config_module.load().jobs_gcs_bucket
+    if not bucket:
+        _package_logger.warning(
+            "No AQA_JOBS_GCS_BUCKET; chat transcripts last only for this process."
+        )
+        _local_task_store = LocalTaskStore()
+        return _local_task_store
+    _local_task_store = None
+    return GcsTaskStore(bucket)
+
+
+@asynccontextmanager
+async def _lifespan(fastapi_app: FastAPI) -> AsyncIterator[None]:
+    """Manages application startup checks and A2A service attachment.
+
+    Initializes storage providers, runs schema validation, constructs the chat
+    agent, and registers A2A routes.
+
+    Args:
+        fastapi_app: FastAPI application instance.
+
+    Yields:
+        None while the application serves requests.
+    """
+    # Storage first: the checks below are the first thing to reach a seam. In
+    # the lifespan rather than at import, so importing this module rewires
+    # nothing.
+    backends.configure_providers()
+    # Both checks read a live BigQuery table's schema. Standalone has no
+    # dataset, and an in-process store has no schema to fall behind the models.
+    if not config_module.load().standalone:
+        await check_investigations_schema()
+        await check_insights_schema()
+    agent = chat_agent.build_chat_agent()
+    # One agent, one runner. `attach_a2a_routes` uses `agent` only to build the
+    # card and executes whatever `runner` wraps, so a runner over a *different*
+    # agent publishes a card that does not describe what is served.
+    #
+    # The chat agent and not `root_agent`: the orchestrator can rewrite config,
+    # and this surface must not reach that.
+    await attach_a2a_routes(
+        fastapi_app,
+        agent=agent,
+        runner=Runner(
+            app=App(name=agent.name, root_agent=agent),
+            session_service=services.get_session_service(),
+            artifact_service=services.get_artifact_service(),
+            auto_create_session=True,
+        ),
+        task_store=_build_task_store(),
+        rpc_path=A2A_RPC_PATH,
+    )
+    try:
+        yield
+    finally:
+        # Best-effort shutdown: containers may terminate abruptly during scale-to-zero
+        # without running ASGI lifespan cleanup.
+        telemetry_setup.shutdown_spans()
+
+
+app: FastAPI = get_fast_api_app(
+    agents_dir=AGENT_DIR,
+    web=True,
+    # `shared://` so ADK's web routes and every surface attached in `_lifespan`
+    # resolve one service each, and a session created on one is visible to the
+    # others. `get_fast_api_app` takes URIs, not objects, so the registry in
+    # `app_utils.services` is the only seam for that.
+    session_service_uri=services.SESSION_SERVICE_URI,
+    artifact_service_uri=services.ARTIFACT_SERVICE_URI,
+    # Registers /api/reasoning_engine and /api/stream_reasoning_engine. Without
+    # it ADK serves only its own routes and `:asyncQuery` has nothing to call.
+    gemini_enterprise_app_name=APP_NAME,
+    lifespan=_lifespan,
+)
+
+# Attached after get_fast_api_app() initializes and installs the global tracer provider.
+telemetry_setup.attach_gcs_exporter(trace.get_tracer_provider())
+
+app.title = "ambient-quality-agent"
+app.description = "Ambient Quality Agent (AQA) orchestrator"
+
+app.include_router(ambient_router)
+app.include_router(commands_router)
+
+
+def _build_local_contexts_unavailable_response() -> JSONResponse:
+    """Builds a 501 response when in-memory context listing is inactive.
+
+    Returns:
+        HTTP 501 JSONResponse indicating contexts are served from GCS.
+    """
+    return JSONResponse(
+        {
+            "error": "not available in AQuA",
+            "area": "contexts",
+            "detail": "Contexts are stored in Cloud Storage.",
+        },
+        status_code=501,
+    )
+
+
+@app.get("/lha/contexts")
+@app.get("/lha/contexts/")
+async def list_local_contexts() -> JSONResponse:
+    """Lists in-memory conversation contexts when running without a jobs bucket.
+
+    Returns:
+        JSONResponse with ``contexts`` or HTTP 501 when GCS backs storage.
+    """
+    if _local_task_store is None:
+        return _build_local_contexts_unavailable_response()
+    return JSONResponse({"contexts": list(_local_task_store.list_contexts())})
+
+
+@app.get("/lha/contexts/{context_id}/tasks")
+async def list_local_context_tasks(context_id: str) -> JSONResponse:
+    """Lists in-memory tasks for one conversation context.
+
+    Args:
+        context_id: Conversation context identifier.
+
+    Returns:
+        JSONResponse with ``tasks`` or HTTP 501 when GCS backs storage.
+    """
+    if _local_task_store is None:
+        return _build_local_contexts_unavailable_response()
+    return JSONResponse(
+        {"tasks": list(_local_task_store.list_context_tasks(context_id))}
+    )
+
+
+@app.delete("/lha/contexts/{context_id}")
+async def delete_local_context(context_id: str) -> JSONResponse:
+    """Deletes an in-memory conversation context and its saved title.
+
+    Args:
+        context_id: Conversation context identifier.
+
+    Returns:
+        JSONResponse with ``deleted`` count or HTTP 501 when GCS backs storage.
+    """
+    if _local_task_store is None:
+        return _build_local_contexts_unavailable_response()
+    return JSONResponse(
+        {"deleted": _local_task_store.delete_context(context_id)}
+    )
+
+
+@app.put("/lha/contexts/{context_id}/title")
+async def save_local_context_title(
+    context_id: str, request: Request
+) -> JSONResponse:
+    """Saves a user-chosen title for an in-memory conversation context.
+
+    Args:
+        context_id: Conversation context identifier.
+        request: Incoming HTTP request carrying ``{"title": ...}``.
+
+    Returns:
+        JSONResponse with ``title`` or HTTP 400/501 on invalid input or GCS mode.
+    """
+    if _local_task_store is None:
+        return _build_local_contexts_unavailable_response()
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "Expected a JSON body."}, status_code=400)
+    title = body.get("title") if isinstance(body, dict) else None
+    if not isinstance(title, str) or not title.strip():
+        return JSONResponse(
+            {"error": "Expected a non-empty string `title`."}, status_code=400
+        )
+    cleaned = title.strip()
+    if len(cleaned) > _CONTEXT_TITLE_MAX_LENGTH:
+        return JSONResponse(
+            {
+                "error": (
+                    f"`title` is longer than {_CONTEXT_TITLE_MAX_LENGTH} "
+                    "characters."
+                )
+            },
+            status_code=400,
+        )
+    try:
+        _local_task_store.save_context_title(context_id, cleaned)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse({"title": cleaned})
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))  # noqa: S104 - direct runs mirror the container CMD's all-interfaces bind

@@ -1,0 +1,40 @@
+.DS_Store
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+node_modules/
+.venv/
+dist/
+build/
+debug*/
+
+# Secrets
+*.env
+!config.env.example
+
+# Generated at runtime
+interpolation_*.mp4
+r2v_*.mp4
+.adk/
+.pytest_cache/
+
+# Test coverage
+.coverage
+
+# Tool outputs
+deployment_metadata.json
+*.log
+genmedia4commerce/app_utils/.requirements.txt
+# internal only: tracked in the internal repo, never added in adk-recipes
+# (git add skips ignored files; use git add -f here for new internal-only files).
+# .github/: this repo's CI, Docker check, Dependabot and release scanner;
+# adk-recipes runs its own (GitHub reads only a repository's root .github).
+/compliance.md
+/PUBLISHING.md
+/.secrets.baseline
+/repo_metadata.yaml
+/.github/
+/push_to_customer.sh
+# make tf-check / setup-infra provider lock (not tracked)
+.terraform.lock.hcl

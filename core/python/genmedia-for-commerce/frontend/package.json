@@ -1,0 +1,41 @@
+{
+  "name": "genmedia-studio-frontend",
+  "private": true,
+  "version": "2.0.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:mock": "vite --config vite.mock.config.ts",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "lint": "biome ci --indent-style=space --vcs-enabled=true --vcs-client-kind=git --vcs-use-ignore-file=true --assist-enabled=false --css-formatter-enabled=false --css-linter-enabled=false --error-on-warnings .",
+    "format": "biome check --write --indent-style=space --vcs-enabled=true --vcs-client-kind=git --vcs-use-ignore-file=true --assist-enabled=false --css-formatter-enabled=false --css-linter-enabled=false .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-router-dom": "^7.15.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.10",
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^16.3.3",
+    "@types/node": "^20.19.43",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "autoprefixer": "^10.6.1",
+    "jsdom": "^29.1.1",
+    "msw": "^2.15.0",
+    "postcss": "^8.5.14",
+    "tailwindcss": "^3.4.19",
+    "typescript": "^6.0.3",
+    "vite": "^8.3.4",
+    "vitest": "^4.1.12"
+  },
+  "overrides": {
+    "postcss-selector-parser": "^7.1.6"
+  }
+}
